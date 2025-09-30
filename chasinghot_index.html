@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-TW">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Chasing Hot — 表面溫度換算器 (Demo)</title>
+  <style>
+    :root{font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Noto Sans TC',"PingFang TC","Microsoft JhengHei",sans-serif}
+    body{margin:0;padding:24px;background:#f7fafc;color:#0f172a}
+    h1{margin:0 0 12px;font-size:20px}
+    .card{background:white;padding:14px;border-radius:10px;box-shadow:0 6px 18px rgba(6,8,15,0.06);margin-bottom:12px}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
+    label{font-size:13px}
+    input,select,button{padding:8px;border-radius:8px;border:1px solid #e6e9ef}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:8px;text-align:left;border-bottom:1px solid #eef2f7}
+    .swatch{width:28px;height:18px;border-radius:4px;display:inline-block;margin-right:8px;vertical-align:middle}
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px}
+    .tile{padding:10px;border-radius:8px;color:white;min-height:72px;display:flex;flex-direction:column;justify-content:center}
+    .muted{color:#475569;font-size:13px}
+    .footer{font-size:13px;color:#475569;margin-top:8px}
+    .controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    pre{background:#0b1220;color:#c7d2fe;padding:8px;border-radius:8px;overflow:auto}
+  </style>
+</head>
+<body>
+  <h1>Chasing Hot — 表面溫度換算器（示範）</h1>
+  <div class="card">
+    <div class="row">
+      <div style="flex:1 1 320px">
+        <label>選擇含溫度的 CSV 檔（或拉入）：<br>
+          <input id="file" type="file" accept="text/csv" />
+        </label>
+        <div class="muted">CSV 欄位格式 (範例)：<br><code>id,location,tmax,tmin</code></div>
+      </div>
+      <div style="width:220px">
+        <label>緯度 φ (度, 北緯為正)：<br>
+          <input id="lat" type="number" value="25.03" step="0.01" />
+        </label>
+      </div>
+      <div style="width:220px">
+        <label>日期 (用以計算年度日)：<br>
+          <input id="date" type="date" value="2025-07-01" />
+        </label>
+      </div>
+    </div>
+    <div style="margin-top:12px" class="controls">
+      <button id="process">處理並顯示</button>
+      <button id="download-sample">下載範例 CSV</button>
+      <div class="muted">預設材質與 albedo（可在表格內編輯）：柏油0.08、水泥0.395、草地0.275、PU跑道0.125</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>輸出：各地與各鋪面估計表面溫度</h3>
+    <div id="summary" class="muted">尚未處理任何檔案</div>
+    <div id="tiles" style="margin-top:10px" class="grid"></div>
+    <div style="margin-top:12px">
+      <table id="result-table"><thead><tr><th>id</th><th>location</th><th>tmax</th><th>tmin</th><th>ΔT</th><th>雲遮係數</th><th>Rs_obs (W/m²)</th><th>材質</th><th>albedo</th><th>表面溫度 (°C)</th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>說明與部署</h3>
+    <div class="muted">本頁為純前端靜態網頁，放到 GitHub Pages（或 gh-pages branch）即可使用。上傳 CSV，欄位須包含 <code>id,location,tmax,tmin</code>。若你要我幫你把它放到你提供的 repo，我可以協助產生完整 repo 結構與 README。</div>
+  </div>
+
+<script>
+// 常數與預設
+const GSC = 1367; // W/m2
+const sigma = 5.67e-8; // Stefan-Boltzmann
+const defaultEmissivity = 0.95;
+const presets = [
+  {name:'柏油',albedo:0.08},
+  {name:'水泥',albedo:0.395},
+  {name:'草地',albedo:0.275},
+  {name:'PU跑道',albedo:0.125}
+];
+
+function deg2rad(d){return d*Math.PI/180}
+function rad2deg(r){return r*180/Math.PI}
+
+function dayOfYearFromDateString(s){const d=new Date(s+'T00:00:00');const start=new Date(d.getFullYear(),0,0);const diff=d-start;return Math.floor(diff/1000/60/60/24)}
+
+function calc_delta(n){ // formula 1
+  // δ = 23.45° * sin(360/365 * (n - 81))
+  return 23.45 * Math.sin(deg2rad(360/365*(n-81)));
+}
+function calc_alpha(phi,delta){ // formula 2
+  return 90 - Math.abs(phi - delta);
+}
+function calc_E0(n){ return 1 + 0.033 * Math.cos(deg2rad(360*n/365)); }
+
+function calc_Rsmax(n,phi){
+  const delta = calc_delta(n);
+  const alpha = calc_alpha(phi,delta);
+  const alphaRad = deg2rad(Math.max(0,alpha));
+  const E0 = calc_E0(n);
+  const Rsmax = GSC * E0 * Math.sin(alphaRad);
+  return Math.max(0, Rsmax);
+}
+
+function clamp01(x){return Math.max(0,Math.min(1,x));}
+
+function surfaceTempFrom_RS(RSobs, albedo, emissivity=defaultEmissivity){
+  // 吸收的短波
+  const absorbed = RSobs * (1 - albedo);
+  // Stefan-Boltzmann inversion: T = ((ε * absorbed)/σ)^(1/4)
+  const T_K = Math.pow((emissivity * absorbed)/sigma, 1/4);
+  const T_C = T_K - 273.15;
+  return {T_C,absorbed};
+}
+
+function colorForTemp(t){ // linear 20..80 -> blue..red
+  const min=20,max=80;const v=(t-min)/(max-min);const vv=Math.max(0,Math.min(1,v));
+  // simple gradient
+  const r=Math.round(255*vv);
+  const g=Math.round(120*(1-vv));
+  const b=Math.round(255*(1-vv));
+  return `rgb(${r},${g},${b})`;
+}
+
+// CSV parsing (simple)
+function parseCSV(text){
+  const lines=text.trim().split(/\r?\n/).map(l=>l.trim()).filter(l=>l.length);
+  const header=lines[0].split(/,\s*/).map(h=>h.toLowerCase());
+  const rows=[];
+  for(let i=1;i<lines.length;i++){
+    const parts=lines[i].split(/,\s*/);
+    const obj={};
+    for(let j=0;j<header.length;j++){obj[header[j]]=parts[j]||''}
+    rows.push(obj);
+  }
+  return {header,rows};
+}
+
+// UI
+document.getElementById('download-sample').addEventListener('click',()=>{
+  const csv = 'id,location,tmax,tmin\n1,操場,36.5,30.2\n2,校園廣場,40.1,29.0\n3,停車場,45.2,28.7\n';
+  const blob=new Blob([csv],{type:'text/csv'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');a.href=url;a.download='sample_temps.csv';a.click();URL.revokeObjectURL(url);
+});
+
+document.getElementById('process').addEventListener('click',async ()=>{
+  const f=document.getElementById('file').files[0];
+  const lat=parseFloat(document.getElementById('lat').value)||25.03;
+  const date=document.getElementById('date').value||'2025-07-01';
+  if(!f){alert('請先選擇 CSV 檔');return}
+  const text = await f.text();
+  const parsed=parseCSV(text);
+  const n = dayOfYearFromDateString(date);
+  const Rsmax = calc_Rsmax(n, lat);
+  const tbody=document.querySelector('#result-table tbody'); tbody.innerHTML='';
+  const tilesDiv=document.getElementById('tiles'); tilesDiv.innerHTML='';
+  let count=0;
+  parsed.rows.forEach(row=>{
+    const id=row.id||row.ID||'';
+    const loc=row.location||row.Location||'';
+    const tmax=parseFloat(row.tmax);
+    const tmin=parseFloat(row.tmin);
+    if(Number.isFinite(tmax) && Number.isFinite(tmin)){
+      const deltaObs = tmax - tmin;
+      const deltaMax = 0.3 * Rsmax + 6; // 文獻給定
+      const cloudCoef = clamp01(deltaObs / deltaMax);
+      const Rsobs = Rsmax * cloudCoef;
+      presets.forEach(p=>{
+        const s = surfaceTempFrom_RS(Rsobs, p.albedo, defaultEmissivity);
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${id}</td><td>${loc}</td><td>${tmax}</td><td>${tmin}</td><td>${deltaObs.toFixed(2)}</td><td>${cloudCoef.toFixed(3)}</td><td>${Rsobs.toFixed(2)}</td><td>${p.name}</td><td>${p.albedo}</td><td>${s.T_C.toFixed(2)}</td>`;
+        tbody.appendChild(tr);
+        // tile
+        const tile=document.createElement('div');tile.className='tile';tile.style.background=colorForTemp(s.T_C);
+        tile.innerHTML = `<strong>${loc} — ${p.name}</strong><div style="font-size:14px">${s.T_C.toFixed(1)} °C</div><div class="muted">albedo ${p.albedo}</div>`;
+        tilesDiv.appendChild(tile);
+      });
+      count++;
+    }
+  });
+  document.getElementById('summary').textContent = `處理 ${count} 筆地點；使用日期 ${date}（年度日 ${n}），緯度 ${lat}，Rsmax=${Rsmax.toFixed(1)} W/m²`;
+});
+</script>
+</body>
+</html>
